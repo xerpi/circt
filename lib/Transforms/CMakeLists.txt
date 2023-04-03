@@ -1,4 +1,5 @@
 add_circt_library(CIRCTTransforms
+  ConvertVectorTypeToHWArrayType.cpp
   FlattenMemRefs.cpp
   StripDebugInfoWithPred.cpp
 

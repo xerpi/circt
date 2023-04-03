@@ -53,4 +53,11 @@ def StripDebugInfoWithPred : Pass<"strip-debuginfo-with-pred", "::mlir::ModuleOp
            "intended to be used for testing."> ];
 }
 
+def ConvertVectorTypeToHWArrayType : Pass<"convert-vectortype-to-hwarraytype", "::mlir::ModuleOp"> {
+  let summary = "Converts VectorType to HW ArrayType";
+  let description = [{
+    Converts VectorType to HW ArrayType.}];
+  let constructor = "circt::createVectorTypeToHWArrayTypeConversion()";
+}
+
 #endif // CIRCT_TRANSFORMS_PASSES
