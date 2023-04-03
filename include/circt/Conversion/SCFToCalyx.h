@@ -31,6 +31,12 @@ static constexpr std::string_view sPortNameAttr = "calyx.port_name";
 // memref::LoadOp.
 static constexpr std::string_view sSequentialReads = "calyx.sequential_reads";
 
+// If this integer attribute is set as a FuncOp argument of type MemRefType,
+// it specifies the data width of the memory. If not set, it is inferred from
+// the MemRefType's element type. It also adds an "access_size" signal to the
+// external memory interface, driven by read and write memory accesses.
+static constexpr std::string_view sDataBusWidth = "calyx.data_bus_width";
+
 } // namespace scfToCalyx
 
 /// Create an SCF to Calyx conversion pass.

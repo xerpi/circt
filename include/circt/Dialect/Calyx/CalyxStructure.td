@@ -466,7 +466,6 @@ def CombGroupOp : CalyxOp<"comb_group", [
 }
 
 def AssignOp : CalyxOp<"assign", [
-    SameTypeConstraint<"dest", "src">,
     ParentOneOf<["GroupOp", "CombGroupOp", "WiresOp"]>
   ]> {
   let summary = "Calyx Assignment";

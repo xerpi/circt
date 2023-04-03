@@ -27,6 +27,14 @@ calyx::RegisterOp createRegister(Location loc, OpBuilder &builder,
   return builder.create<RegisterOp>(loc, (prefix + "_reg").str(), width);
 }
 
+calyx::RegisterOp createRegister(Location loc, OpBuilder &builder,
+                                 ComponentOp component, Type type,
+                                 Twine prefix) {
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(component.getBodyBlock());
+  return builder.create<RegisterOp>(loc, (prefix + "_reg").str(), type);
+}
+
 hw::ConstantOp createConstant(Location loc, OpBuilder &builder,
                               ComponentOp component, size_t width,
                               size_t value) {
@@ -74,6 +82,28 @@ void addMandatoryComponentPorts(PatternRewriter &rewriter,
 
 unsigned handleZeroWidth(int64_t dim) {
   return std::max(llvm::Log2_64_Ceil(dim), 1U);
+}
+
+unsigned getTypeSize(Type type) {
+  if (auto intType = type.dyn_cast<IntegerType>())
+    return intType.getIntOrFloatBitWidth();
+  else if (auto hwArrayType = type.dyn_cast<hw::ArrayType>())
+    return getTypeSize(hwArrayType.getElementType()) * hwArrayType.getSize();
+  else if (auto vectorType = type.dyn_cast<VectorType>())
+    return getTypeSize(vectorType.getElementType()) *
+           vectorType.getNumElements();
+  llvm_unreachable("Unsupported type");
+}
+
+hw::ArrayType vectorTypeToHWArrayType(VectorType vectorType) {
+  return hw::ArrayType::get(vectorType.getElementType(),
+                            vectorType.getNumElements());
+}
+
+Type convertType(Type type) {
+  if (auto vectorType = type.dyn_cast<VectorType>())
+    return vectorTypeToHWArrayType(vectorType);
+  return type;
 }
 
 } // namespace calyx

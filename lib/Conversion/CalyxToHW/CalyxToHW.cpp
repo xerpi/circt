@@ -12,6 +12,7 @@
 
 #include "circt/Conversion/CalyxToHW.h"
 #include "../PassDetail.h"
+#include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombOps.h"
@@ -21,6 +22,7 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -124,9 +126,24 @@ struct ConvertAssignOp : public OpConversionPattern<calyx::AssignOp> {
   matchAndRewrite(calyx::AssignOp assign, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Value src = adaptor.getSrc();
+
+    // llvm::errs() << "calyx::AssignOp\n";
+    // assign.dump();
+
+    Type srcType = convertType(src.getType());
+
     if (auto guard = adaptor.getGuard()) {
-      auto zero =
-          rewriter.create<hw::ConstantOp>(assign.getLoc(), src.getType(), 0);
+      Value zero;
+      if (auto arrayType = dyn_cast<hw::ArrayType>(srcType)) {
+        SmallVector<Value> zeroValues;
+        for (size_t i = 0; i < arrayType.getSize(); i++)
+          zeroValues.push_back(rewriter.create<hw::ConstantOp>(
+              assign.getLoc(), arrayType.getElementType(), 0));
+        zero = rewriter.create<hw::ArrayCreateOp>(assign.getLoc(), zeroValues);
+      } else {
+        zero = rewriter.create<hw::ConstantOp>(assign.getLoc(), srcType, 0);
+      }
+
       src = rewriter.create<MuxOp>(assign.getLoc(), guard, src, zero);
       for (Operation *destUser :
            llvm::make_early_inc_range(assign.getDest().getUsers())) {
@@ -145,11 +162,119 @@ struct ConvertAssignOp : public OpConversionPattern<calyx::AssignOp> {
     // converter. This means assigns to ComponentOp outputs will try to assign
     // to a read from a wire, so we need to map to the wire.
     Value dest = adaptor.getDest();
+
     if (auto readInOut = dyn_cast<ReadInOutOp>(dest.getDefiningOp()))
       dest = readInOut.getInput();
 
-    rewriter.replaceOpWithNewOp<sv::AssignOp>(assign, dest, src);
+    Type dstRawType = dest.getType();
+    if (auto inoutType = dstRawType.dyn_cast<circt::hw::InOutType>())
+      dstRawType = inoutType.getElementType();
+    dstRawType = convertType(dstRawType);
 
+    // llvm::errs() << "srcType: " << srcType << ", dstRawType: " << dstRawType
+    //              << "\n";
+
+    if (srcType != dstRawType) {
+      // llvm::errs() << "srcType != dstRawType\n";
+
+      int srcTypeSize = getTypeSize(srcType);
+      int dstRawTypeSize = getTypeSize(dstRawType);
+
+      if (srcTypeSize > dstRawTypeSize) {
+        auto base = rewriter.create<hw::ConstantOp>(
+            assign.getLoc(), rewriter.getI32IntegerAttr(0));
+        src = rewriter.create<sv::IndexedPartSelectOp>(assign.getLoc(), src,
+                                                       base, dstRawTypeSize);
+      }
+
+      // array -> bits
+      if (hw::ArrayType srcArrayType = srcType.dyn_cast<hw::ArrayType>()) {
+        uint32_t srcArrayElementSize =
+            srcArrayType.getElementType().getIntOrFloatBitWidth();
+
+        // llvm::errs() << "srcArrayElementSize: " << srcArrayElementSize <<
+        // "\n"; llvm::errs() << "srcArray.getSize(): " <<
+        // srcArrayType.getSize()
+        //              << "\n";
+
+        uint32_t indexBits = llvm::Log2_32_Ceil(srcArrayType.getSize());
+        for (size_t i = 0; i < srcArrayType.getSize(); i++) {
+          auto base = rewriter.create<hw::ConstantOp>(
+              assign.getLoc(),
+              rewriter.getI32IntegerAttr(i * srcArrayElementSize));
+          auto destIndexedPartSelect =
+              rewriter.create<sv::IndexedPartSelectInOutOp>(
+                  assign.getLoc(), dest, base, srcArrayElementSize);
+
+          auto srcElementIndex = rewriter.create<hw::ConstantOp>(
+              assign.getLoc(),
+              rewriter.getIntegerAttr(rewriter.getIntegerType(indexBits), i));
+          auto srcElement = rewriter.create<hw::ArrayGetOp>(
+              assign.getLoc(), src, srcElementIndex);
+
+          rewriter.create<sv::AssignOp>(assign.getLoc(), destIndexedPartSelect,
+                                        srcElement);
+        }
+      } else if (hw::ArrayType dstArrayType =
+                     dstRawType.dyn_cast<hw::ArrayType>()) { // bits -> array
+        uint32_t dstArrayElementSize =
+            dstArrayType.getElementType().getIntOrFloatBitWidth();
+        // llvm::errs() << "dstArrayElementSize: " << dstArrayElementSize <<
+        // "\n"; llvm::errs() << "dstArray.getSize(): " <<
+        // dstArrayType.getSize()
+        //              << "\n";
+
+        uint32_t indexBits = llvm::Log2_32_Ceil(dstArrayType.getSize());
+        for (size_t i = 0; i < dstArrayType.getSize(); i++) {
+          auto base = rewriter.create<hw::ConstantOp>(
+              assign.getLoc(),
+              rewriter.getI32IntegerAttr(i * dstArrayElementSize));
+          auto srcIndexedPartSelect = rewriter.create<sv::IndexedPartSelectOp>(
+              assign.getLoc(), src, base, dstArrayElementSize);
+
+          auto dstElementIndex = rewriter.create<hw::ConstantOp>(
+              assign.getLoc(),
+              rewriter.getIntegerAttr(rewriter.getIntegerType(indexBits), i));
+          auto dstElement = rewriter.create<sv::ArrayIndexInOutOp>(
+              assign.getLoc(), dest, dstElementIndex);
+
+          rewriter.create<sv::AssignOp>(assign.getLoc(), dstElement,
+                                        srcIndexedPartSelect);
+        }
+      } else {
+        rewriter.create<sv::AssignOp>(assign.getLoc(), dest, src);
+      }
+      rewriter.eraseOp(assign);
+    } else {
+      rewriter.replaceOpWithNewOp<sv::AssignOp>(assign, dest, src);
+    }
+
+    return success();
+  }
+};
+
+struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "arith::ConstantOp\n";
+    op.dump();
+
+    auto vectorType = op.getType().dyn_cast<VectorType>();
+    assert(vectorType);
+
+    SmallVector<Value> values;
+    for (auto value :
+         op.getValueAttr().cast<DenseElementsAttr>().getValues<IntegerAttr>()) {
+      auto valueConst =
+          rewriter.create<hw::ConstantOp>(op.getLoc(), value.getValue());
+      values.push_back(valueConst);
+    }
+
+    rewriter.replaceOpWithNewOp<hw::ArrayCreateOp>(op, convertType(vectorType),
+                                                   values);
     return success();
   }
 };
@@ -319,6 +444,25 @@ private:
               op.instanceName(), op.portName(op.getOut()), b);
           wires.append({in.getInput(), extsi});
         })
+        .Case([&](SplatLibOp op) {
+          auto in =
+              wireIn(op.getIn(), op.instanceName(), op.portName(op.getIn()), b);
+
+          llvm::errs() << "SplatLibOp\n";
+          op.dump();
+
+          VectorType outType = op.getOut().getType().dyn_cast<VectorType>();
+          assert(outType);
+          SmallVector<Value> values;
+          for (int64_t i = 0; i < outType.getNumElements(); i++)
+            values.push_back(in);
+          auto array = b.create<hw::ArrayCreateOp>(
+              vectorTypeToHWArrayType(outType), values);
+
+          auto out =
+              wireOut(array, op.instanceName(), op.portName(op.getOut()), b);
+          wires.append({in.getInput(), out});
+        })
         .Default([](Operation *) { return SmallVector<Value>(); });
   }
 
@@ -330,7 +474,20 @@ private:
     auto right =
         wireIn(op.getRight(), op.instanceName(), op.portName(op.getRight()), b);
 
-    auto add = b.create<ResultTy>(left, right, false);
+    Value add;
+    if (auto arrayType = dyn_cast<hw::ArrayType>(left.getType())) {
+      SmallVector<Value> values;
+      for (size_t i = 0; i < arrayType.getSize(); i++) {
+        auto index = b.create<hw::ConstantOp>(b.getIntegerAttr(
+            b.getIntegerType(llvm::Log2_32_Ceil(arrayType.getSize())), i));
+        auto l = b.createOrFold<hw::ArrayGetOp>(left, index);
+        auto r = b.createOrFold<hw::ArrayGetOp>(right, index);
+        values.push_back(b.create<ResultTy>(l, r, false));
+      }
+      add = b.create<hw::ArrayCreateOp>(values);
+    } else {
+      add = b.create<ResultTy>(left, right, false);
+    }
 
     auto out = wireOut(add, op.instanceName(), op.portName(op.getOut()), b);
     wires.append({left.getInput(), right.getInput(), out});
@@ -370,15 +527,43 @@ private:
                        op.instanceName() + "_" + op.portName(op.getDone()), b);
     auto done =
         wireOut(doneReg, op.instanceName(), op.portName(op.getDone()), b);
+    auto clockEn = b.create<AndOp>(go, createOrFoldNot(done, b));
 
-    auto targetOp = b.create<TargetOpTy>(left, right, false);
-    for (auto &&[targetRes, sourceRes] :
-         llvm::zip(targetOp->getResults(), op.getOutputPorts())) {
-      auto portName = op.portName(sourceRes);
-      auto clockEn = b.create<AndOp>(go, createOrFoldNot(done, b));
-      auto resReg = regCe(targetRes, clk, clockEn, reset,
-                          createName(op.instanceName(), portName), b);
-      wires.push_back(wireOut(resReg, op.instanceName(), portName, b));
+    if (auto arrayType = dyn_cast<hw::ArrayType>(left.getType())) {
+      SmallVector<TargetOpTy> lanes;
+      for (size_t i = 0; i < arrayType.getSize(); i++) {
+        auto index = b.create<hw::ConstantOp>(b.getIntegerAttr(
+            b.getIntegerType(llvm::Log2_32_Ceil(arrayType.getSize())), i));
+        auto l = b.createOrFold<hw::ArrayGetOp>(left, index);
+        auto r = b.createOrFold<hw::ArrayGetOp>(right, index);
+        TargetOpTy val = b.create<TargetOpTy>(l, r, false);
+        llvm::outs() << "getResults: " << val->getResults().size() << "\n";
+        lanes.push_back(val);
+      }
+
+      llvm::outs() << "Num ports: " << op.getOutputPorts().size() << "\n";
+
+      for (size_t i = 0; i < llvm::range_size(op.getOutputPorts()); i++) {
+        SmallVector<Value> resultValues;
+        for (auto &lane : lanes) {
+          resultValues.push_back(lane->getResult(i));
+        }
+        auto result = b.create<hw::ArrayCreateOp>(arrayType, resultValues);
+        auto portName = op.portName(op.getOutputPorts()[i]);
+        auto resReg = regCe(result, clk, clockEn, reset,
+                            createName(op.instanceName(), portName), b);
+        wires.push_back(wireOut(resReg, op.instanceName(), portName, b));
+        break;
+      }
+    } else {
+      auto targetOp = b.create<TargetOpTy>(left, right, false);
+      for (auto &&[targetRes, sourceRes] :
+           llvm::zip(targetOp->getResults(), op.getOutputPorts())) {
+        auto portName = op.portName(sourceRes);
+        auto resReg = regCe(targetRes, clk, clockEn, reset,
+                            createName(op.instanceName(), portName), b);
+        wires.push_back(wireOut(resReg, op.instanceName(), portName, b));
+      }
     }
 
     wires.push_back(done);
@@ -386,14 +571,14 @@ private:
 
   ReadInOutOp wireIn(Value source, StringRef instanceName, StringRef portName,
                      ImplicitLocOpBuilder &b) const {
-    auto wire = b.create<sv::WireOp>(source.getType(),
+    auto wire = b.create<sv::WireOp>(calyx::convertType(source.getType()),
                                      createName(instanceName, portName));
     return b.create<ReadInOutOp>(wire);
   }
 
   ReadInOutOp wireOut(Value source, StringRef instanceName, StringRef portName,
                       ImplicitLocOpBuilder &b) const {
-    auto wire = b.create<sv::WireOp>(source.getType(),
+    auto wire = b.create<sv::WireOp>(calyx::convertType(source.getType()),
                                      createName(instanceName, portName));
     b.create<sv::AssignOp>(wire, source);
     return b.create<ReadInOutOp>(wire);
@@ -409,7 +594,16 @@ private:
 
   CompRegClockEnabledOp regCe(Value source, Value clock, Value ce, Value reset,
                               Twine name, ImplicitLocOpBuilder &b) const {
-    auto resetValue = b.create<hw::ConstantOp>(source.getType(), 0);
+    Value resetValue;
+    if (auto arrayType = dyn_cast<hw::ArrayType>(source.getType())) {
+      SmallVector<Value> resetValues;
+      for (size_t i = 0; i < arrayType.getSize(); i++)
+        resetValues.push_back(
+            b.create<hw::ConstantOp>(arrayType.getElementType(), 0));
+      resetValue = b.create<hw::ArrayCreateOp>(resetValues);
+    } else {
+      resetValue = b.create<hw::ConstantOp>(source.getType(), 0);
+    }
     auto regName = b.getStringAttr(name);
     return b.create<CompRegClockEnabledOp>(source.getType(), source, clock, ce,
                                            regName, reset, resetValue, regName);
@@ -457,6 +651,7 @@ LogicalResult CalyxToHWPass::runOnModule(ModuleOp module) {
   patterns.add<ConvertControlOp>(&context);
   patterns.add<ConvertCellOp>(&context);
   patterns.add<ConvertAssignOp>(&context);
+  patterns.add<ConvertArithConstantOp>(&context);
 
   return applyPartialConversion(module, target, std::move(patterns));
 }

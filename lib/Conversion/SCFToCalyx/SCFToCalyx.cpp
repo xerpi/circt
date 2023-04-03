@@ -23,6 +23,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LogicalResult.h"
@@ -36,6 +37,7 @@ using namespace mlir;
 using namespace mlir::arith;
 using namespace mlir::cf;
 using namespace mlir::func;
+using namespace mlir::vector;
 
 namespace circt {
 class ComponentLoweringStateInterface;
@@ -122,7 +124,9 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
                              AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
                              MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                             IndexCastOp>(
+                             IndexCastOp,
+                             /// Vector
+                             vector::SplatOp, vector::LoadOp, vector::StoreOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<scf::WhileOp, FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -170,6 +174,9 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, vector::SplatOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, vector::LoadOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, vector::StoreOp op) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
   /// source operation TSrcOp.
@@ -241,11 +248,10 @@ private:
                                          TOpType opPipe, Value out) const {
     StringRef opName = TSrcOp::getOperationName().split(".").second;
     Location loc = op.getLoc();
-    Type width = op.getResult().getType();
     // Pass the result from the Operation to the Calyx primitive.
     op.getResult().replaceAllUsesWith(out);
     auto reg = createRegister(
-        op.getLoc(), rewriter, getComponent(), width.getIntOrFloatBitWidth(),
+        op.getLoc(), rewriter, getComponent(), op.getResult().getType(),
         getState<ComponentLoweringState>().getUniqueName(opName));
     // Operation pipelines are not combinational, so a GroupOp is required.
     auto group = createGroupForOp<calyx::GroupOp>(rewriter, op);
@@ -312,6 +318,16 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     rewriter.create<calyx::AssignOp>(
         loadOp.getLoc(), memoryInterface.readEn(),
         createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1));
+
+    if (memoryInterface.hasAccessSize()) {
+      int accessSizeBits = calyx::getTypeSize(loadOp.getResult().getType());
+      assert(accessSizeBits % 8 == 0);
+      int accessSize = llvm::Log2_32(accessSizeBits / 8);
+      rewriter.create<calyx::AssignOp>(
+          loadOp.getLoc(), memoryInterface.accessSize(),
+          createConstant(loadOp.getLoc(), rewriter, getComponent(), 3,
+                         accessSize));
+    }
 
     // Assign the memory read data to the register input, and the memory read
     // done signal to the register "write enable". Group done is driven
@@ -397,6 +413,98 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   rewriter.create<calyx::AssignOp>(
       storeOp.getLoc(), memoryInterface.writeEn(),
       createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1));
+  if (memoryInterface.hasAccessSize()) {
+    int accessSizeBits = calyx::getTypeSize(storeOp.getValue().getType());
+    assert(accessSizeBits % 8 == 0);
+    int accessSize = llvm::Log2_32(accessSizeBits / 8);
+    rewriter.create<calyx::AssignOp>(
+        storeOp.getLoc(), memoryInterface.accessSize(),
+        createConstant(storeOp.getLoc(), rewriter, getComponent(), 3,
+                       accessSize));
+  }
+  rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(), memoryInterface.done());
+
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     vector::SplatOp op) const {
+  return buildLibraryOp<calyx::CombGroupOp, calyx::SplatLibOp>(
+      rewriter, op, {op.getOperand().getType()}, {op.getType()});
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     vector::LoadOp loadOp) const {
+  Value memref = loadOp.getBase();
+  auto memoryInterface =
+      getState<ComponentLoweringState>().getMemoryInterface(memref);
+  assert(memoryInterface.sequentialReads());
+
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, loadOp);
+  // Create a register to store the data loaded from memory.
+  auto reg = createRegister(
+      loadOp.getLoc(), rewriter, getComponent(), loadOp.getVectorType(),
+      getState<ComponentLoweringState>().getUniqueName("load_seq"));
+
+  assignAddressPorts(rewriter, loadOp.getLoc(), group, memoryInterface,
+                     loadOp.getIndices());
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  rewriter.create<calyx::AssignOp>(
+      loadOp.getLoc(), memoryInterface.readEn(),
+      createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1));
+
+  if (memoryInterface.hasAccessSize()) {
+    int accessSizeBits = calyx::getTypeSize(loadOp.getVectorType());
+    assert(accessSizeBits % 8 == 0);
+    int accessSize = llvm::Log2_32(accessSizeBits / 8);
+    rewriter.create<calyx::AssignOp>(
+        loadOp.getLoc(), memoryInterface.accessSize(),
+        createConstant(loadOp.getLoc(), rewriter, getComponent(), 3,
+                       accessSize));
+  }
+
+  // Assign the memory read data to the register input, and the memory read
+  // done signal to the register "write enable". Group done is driven
+  // by the register done signal.
+  calyx::buildAssignmentsForRegisterWrite(
+      rewriter, group, reg, memoryInterface.readData(), memoryInterface.done());
+  loadOp.getResult().replaceAllUsesWith(reg.getOut());
+
+  // This is a sequential group, so register it as being scheduleable for the
+  // block.
+  getState<ComponentLoweringState>().addBlockScheduleable(loadOp->getBlock(),
+                                                          group);
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     vector::StoreOp storeOp) const {
+  auto memoryInterface =
+      getState<ComponentLoweringState>().getMemoryInterface(storeOp.getBase());
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, storeOp);
+
+  // This is a sequential group, so register it as being scheduleable for the
+  // block.
+  getState<ComponentLoweringState>().addBlockScheduleable(storeOp->getBlock(),
+                                                          group);
+  assignAddressPorts(rewriter, storeOp.getLoc(), group, memoryInterface,
+                     storeOp.getIndices());
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  rewriter.create<calyx::AssignOp>(
+      storeOp.getLoc(), memoryInterface.writeData(), storeOp.getValueToStore());
+  rewriter.create<calyx::AssignOp>(
+      storeOp.getLoc(), memoryInterface.writeEn(),
+      createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1));
+  if (memoryInterface.hasAccessSize()) {
+    int accessSizeBits =
+        calyx::getTypeSize(storeOp.getValueToStore().getType());
+    assert(accessSizeBits % 8 == 0);
+    int accessSize = llvm::Log2_32(accessSizeBits / 8);
+    rewriter.create<calyx::AssignOp>(
+        storeOp.getLoc(), memoryInterface.accessSize(),
+        createConstant(storeOp.getLoc(), rewriter, getComponent(), 3,
+                       accessSize));
+  }
   rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(), memoryInterface.done());
 
   return success();
@@ -580,11 +688,18 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      arith::ConstantOp constOp) const {
   /// Move constant operations to the compOp body as hw::ConstantOp's.
-  APInt value;
-  calyx::matchConstantOp(constOp, value);
-  auto hwConstOp = rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
-  hwConstOp->moveAfter(getComponent().getBodyBlock(),
+  if (auto vectorType = constOp.getType().dyn_cast<VectorType>()) {
+    /* Lowered at CalyxToHW pass */
+    constOp->moveAfter(getComponent().getBodyBlock(),
                        getComponent().getBodyBlock()->begin());
+  } else {
+    APInt value;
+    calyx::matchConstantOp(constOp, value);
+    auto hwConstOp =
+        rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
+    hwConstOp->moveAfter(getComponent().getBodyBlock(),
+                         getComponent().getBodyBlock()->begin());
+  }
   return success();
 }
 
@@ -673,8 +788,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   LogicalResult res = success();
 
   if (targetBits == sourceBits) {
-    /// Drop the index cast and replace uses of the target value with the source
-    /// value.
+    /// Drop the index cast and replace uses of the target value with the
+    /// source value.
     op.getResult().replaceAllUsesWith(op.getOperand());
   } else {
     /// pad/slice the source operand.
@@ -705,8 +820,8 @@ class InlineExecuteRegionOpPattern
     /// Determine type of "yield" operations inside the ERO.
     TypeRange yieldTypes = execOp.getResultTypes();
 
-    /// Create sink basic block and rewrite uses of yield results to sink block
-    /// arguments.
+    /// Create sink basic block and rewrite uses of yield results to sink
+    /// block arguments.
     rewriter.setInsertionPointAfter(execOp);
     auto *sinkBlock = rewriter.splitBlock(
         execOp->getBlock(),
@@ -755,16 +870,18 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     /// output port index which the return value will eventually map to.
     DenseMap<unsigned, unsigned> funcOpResultMapping;
 
-    /// Maintain a mapping between an external memory argument (identified by a
-    /// memref) and eventual component information: start index of the memory
-    /// ports in the in- and output ports of the component, and a boolean
-    /// indicating whether the memory has sequential reads, and thus requiring a
-    /// "read enable" signal. Ports are expected to be ordered in the same
-    /// manner as they are added by calyx::appendPortsForExternalMemref.
+    /// Maintain a mapping between an external memory argument (identified by
+    /// a memref) and eventual component information: start index of the
+    /// memory ports in the in- and output ports of the component, a boolean
+    /// indicating whether the memory has sequential reads, and thus requiring
+    /// a "read enable" signal, and the data bus width (0 if infer from
+    /// MemRefType). Ports are expected to be ordered in the same manner as
+    /// they are added by calyx::appendPortsForExternalMemref.
     struct ExtMemoryCompInfo {
       size_t inPortsIndex;
       size_t outPortsIndex;
       bool seqReads;
+      int dataBusWidth;
     };
     DenseMap<Value, ExtMemoryCompInfo> extMemoryCompPortInfo;
 
@@ -778,14 +895,19 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         /// External memories
         auto memName = "ext_mem" + std::to_string(extMemoryCompPortInfo.size());
         bool seqReads = false;
+        int dataBusWidth = 0;
         if (auto seqReadsAttr = funcOp.getArgAttrOfType<BoolAttr>(
                 arg.index(), scfToCalyx::sSequentialReads))
           seqReads = seqReadsAttr.getValue();
+        if (auto dataBusWidthAttr = funcOp.getArgAttrOfType<IntegerAttr>(
+                arg.index(), scfToCalyx::sDataBusWidth))
+          dataBusWidth = dataBusWidthAttr.getInt();
+        assert(dataBusWidth <= 1024);
         extMemoryCompPortInfo[arg.value()] = {inPorts.size(), outPorts.size(),
-                                              seqReads};
+                                              seqReads, dataBusWidth};
         calyx::appendPortsForExternalMemref(rewriter, memName, arg.value(),
                                             extMemCounter++, inPorts, outPorts,
-                                            seqReads);
+                                            seqReads, dataBusWidth);
       } else {
         /// Single-port arguments
         std::string inName;
@@ -822,7 +944,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     llvm::append_range(ports, outPorts);
     calyx::addMandatoryComponentPorts(rewriter, ports);
 
-    /// Create a calyx::ComponentOp corresponding to the to-be-lowered function.
+    /// Create a calyx::ComponentOp corresponding to the to-be-lowered
+    /// function.
     auto compOp = rewriter.create<calyx::ComponentOp>(
         funcOp.getLoc(), rewriter.getStringAttr(funcOp.getSymName()), ports);
 
@@ -862,7 +985,12 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
 
       extMemPorts.seqReads = seqReads;
       if (seqReads)
-        extMemPorts.readEn = compOp.getArgument(outPortsIt);
+        extMemPorts.readEn = compOp.getArgument(outPortsIt++);
+
+      if (extMemPortInfo.getSecond().dataBusWidth > 0) {
+        extMemPorts.hasAccessSize = true;
+        extMemPorts.accessSize = compOp.getArgument(outPortsIt);
+      }
 
       /// Register the external memory ports as a memory interface within the
       /// component.
@@ -899,9 +1027,9 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
       /// Check for do-while loops.
       /// TODO(mortbopet) can we support these? for now, do not support loops
       /// where iterargs are changed in the 'before' region. scf.WhileOp also
-      /// has support for different types of iter_args and return args which we
-      /// also do not support; iter_args and while return values are placed in
-      /// the same registers.
+      /// has support for different types of iter_args and return args which
+      /// we also do not support; iter_args and while return values are placed
+      /// in the same registers.
       for (auto barg :
            enumerate(scfWhileOp.getBefore().front().getArguments())) {
         auto condOp = scfWhileOp.getConditionOp().getArgs()[barg.index()];
@@ -918,7 +1046,8 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
 
       /// Create iteration argument registers.
       /// The iteration argument registers will be referenced:
-      /// - In the "before" part of the while loop, calculating the conditional,
+      /// - In the "before" part of the while loop, calculating the
+      /// conditional,
       /// - In the "after" part of the while loop,
       /// - Outside the while loop, rewriting the while loop return values.
       for (auto arg : enumerate(whileOp.getBodyArgs())) {
@@ -939,7 +1068,8 @@ class BuildWhileGroups : public calyx::FuncOpPartialLoweringPattern {
             .replaceAllUsesWith(reg.getOut());
       }
 
-      /// Create iter args initial value assignment group(s), one per register.
+      /// Create iter args initial value assignment group(s), one per
+      /// register.
       SmallVector<calyx::GroupOp> initGroups;
       auto numOperands = whileOp.getOperation()->getNumOperands();
       for (size_t i = 0; i < numOperands; ++i) {
@@ -1037,11 +1167,11 @@ private:
     return success();
   }
 
-  /// Schedules a block by inserting a branch argument assignment block (if any)
-  /// before recursing into the scheduling of the block innards.
-  /// Blocks 'from' and 'to' refer to blocks in the source program.
-  /// parentCtrlBlock refers to the control block wherein control operations are
-  /// to be inserted.
+  /// Schedules a block by inserting a branch argument assignment block (if
+  /// any) before recursing into the scheduling of the block innards. Blocks
+  /// 'from' and 'to' refer to blocks in the source program. parentCtrlBlock
+  /// refers to the control block wherein control operations are to be
+  /// inserted.
   LogicalResult schedulePath(PatternRewriter &rewriter,
                              const DenseSet<Block *> &path, Location loc,
                              Block *from, Block *to,
@@ -1065,7 +1195,8 @@ private:
                                 mlir::Block *block) const {
     if (path.count(block) != 0)
       return preBlock->getTerminator()->emitError()
-             << "CFG backedge detected. Loops must be raised to 'scf.while' or "
+             << "CFG backedge detected. Loops must be raised to 'scf.while' "
+                "or "
                 "'scf.for' operations.";
 
     rewriter.setInsertionPointToEnd(parentCtrlBlock);
@@ -1146,8 +1277,8 @@ private:
   }
 };
 
-/// LateSSAReplacement contains various functions for replacing SSA values that
-/// were not replaced during op construction.
+/// LateSSAReplacement contains various functions for replacing SSA values
+/// that were not replaced during op construction.
 class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
@@ -1221,8 +1352,8 @@ public:
       }
       topLevelFunction = topLevelFunctionOpt;
     } else {
-      /// No top level function set; infer top level if the module only contains
-      /// a single function, else, throw error.
+      /// No top level function set; infer top level if the module only
+      /// contains a single function, else, throw error.
       auto funcOps = moduleOp.getOps<FuncOp>();
       if (std::distance(funcOps.begin(), funcOps.end()) == 1)
         topLevelFunction = (*funcOps.begin()).getSymName().str();
@@ -1269,10 +1400,12 @@ public:
     // Only accept std operations which we've added lowerings for
     target.addIllegalDialect<FuncDialect>();
     target.addIllegalDialect<ArithDialect>();
+    target.addIllegalDialect<VectorDialect>();
     target.addLegalOp<AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
                       XOrIOp, OrIOp, ExtUIOp, TruncIOp, CondBranchOp, BranchOp,
                       MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp, ReturnOp,
-                      arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp>();
+                      arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
+                      vector::SplatOp, vector::LoadOp, vector::StoreOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
@@ -1358,8 +1491,8 @@ void SCFToCalyxPass::runOnOperation() {
   /// view the transformations that's going on.
   /// --------------------------------------------------------------------------
 
-  /// A mapping is maintained between a function operation and its corresponding
-  /// Calyx component.
+  /// A mapping is maintained between a function operation and its
+  /// corresponding Calyx component.
   DenseMap<FuncOp, calyx::ComponentOp> funcMap;
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
@@ -1405,8 +1538,9 @@ void SCFToCalyxPass::runOnOperation() {
   addOncePattern<BuildControl>(loweringPatterns, patternState, funcMap,
                                *loweringState);
 
-  /// This pass recursively inlines use-def chains of combinational logic (from
-  /// non-stateful groups) into groups referenced in the control schedule.
+  /// This pass recursively inlines use-def chains of combinational logic
+  /// (from non-stateful groups) into groups referenced in the control
+  /// schedule.
   addOncePattern<calyx::InlineCombGroups>(loweringPatterns, patternState,
                                           *loweringState);
 

@@ -38,7 +38,7 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
                                   Value memref, unsigned memoryID,
                                   SmallVectorImpl<calyx::PortInfo> &inPorts,
                                   SmallVectorImpl<calyx::PortInfo> &outPorts,
-                                  bool seqReads = false);
+                                  bool seqReads = false, int dataBusWidth = 0);
 
 // Walks the control of this component, and appends source information for leaf
 // nodes. It also appends a position attribute that connects the source location
@@ -93,6 +93,8 @@ struct MemoryPortsImpl {
   Value writeEn;
   bool seqReads = false;
   Value readEn;
+  bool hasAccessSize = false;
+  Value accessSize;
 };
 
 // Represents the interface of memory in Calyx. The various lowering passes
@@ -110,9 +112,12 @@ struct MemoryInterface {
   Value writeEn();
   // Only available if the memory has sequential reads.
   Value readEn();
+  // Only available if the memory user-specifiec data bus width.
+  Value accessSize();
   ValueRange addrPorts();
 
   bool sequentialReads();
+  bool hasAccessSize();
 
 private:
   std::variant<calyx::MemoryOp, MemoryPortsImpl> impl;

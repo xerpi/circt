@@ -229,3 +229,9 @@ def WireLibOp : UnaryLibraryOp<"wire", [SameTypeConstraint<"in", "out">]> {
 }
 
 def ExtSILibOp  : UnaryLibraryOp<"extsi"> {}
+
+def SplatLibOp : CalyxLibraryOp<"splat", [Combinational]> {
+  let summary = "vector splat or broadcast operation";
+  let results = (outs AnyTypeOf<[AnySignlessInteger, Index, AnyFloat],
+                                 "integer/index/float type">:$in, AnyVectorOfAnyRank:$out);
+}

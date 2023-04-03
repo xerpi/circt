@@ -32,7 +32,7 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
                                   Value memref, unsigned memoryID,
                                   SmallVectorImpl<calyx::PortInfo> &inPorts,
                                   SmallVectorImpl<calyx::PortInfo> &outPorts,
-                                  bool seqReads) {
+                                  bool seqReads, int dataBusWidth) {
   MemRefType memrefType = memref.getType().cast<MemRefType>();
 
   // Ports constituting a memory interface are added a set of attributes under
@@ -54,10 +54,16 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
     return rewriter.getNamedAttr("mem", rewriter.getDictionaryAttr(attrs));
   };
 
+  Type dataBusType;
+  if (dataBusWidth == 0)
+    dataBusType = memrefType.getElementType();
+  else
+    dataBusType = rewriter.getIntegerType(dataBusWidth);
+
   // Read data
   inPorts.push_back(calyx::PortInfo{
-      rewriter.getStringAttr(memName + "_read_data"),
-      memrefType.getElementType(), calyx::Direction::Input,
+      rewriter.getStringAttr(memName + "_read_data"), dataBusType,
+      calyx::Direction::Input,
       DictionaryAttr::get(rewriter.getContext(),
                           {getMemoryInterfaceAttr("read_data")})});
 
@@ -70,8 +76,8 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
 
   // Write data
   outPorts.push_back(calyx::PortInfo{
-      rewriter.getStringAttr(memName + "_write_data"),
-      memrefType.getElementType(), calyx::Direction::Output,
+      rewriter.getStringAttr(memName + "_write_data"), dataBusType,
+      calyx::Direction::Output,
       DictionaryAttr::get(rewriter.getContext(),
                           {getMemoryInterfaceAttr("write_data")})});
 
@@ -99,6 +105,16 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
         calyx::Direction::Output,
         DictionaryAttr::get(rewriter.getContext(),
                             {getMemoryInterfaceAttr("read_en")})});
+  }
+
+  // User-specified data bus width
+  if (dataBusWidth != 0) {
+    // Write data
+    outPorts.push_back(calyx::PortInfo{
+        rewriter.getStringAttr(memName + "_access_size"),
+        rewriter.getIntegerType(3), calyx::Direction::Output,
+        DictionaryAttr::get(rewriter.getContext(),
+                            {getMemoryInterfaceAttr("access_size")})});
   }
 }
 
@@ -206,6 +222,13 @@ Value MemoryInterface::readEn() {
   return std::get<MemoryPortsImpl>(impl).readEn;
 }
 
+Value MemoryInterface::accessSize() {
+  if (std::holds_alternative<calyx::MemoryOp>(impl)) {
+    return Value();
+  }
+  return std::get<MemoryPortsImpl>(impl).accessSize;
+}
+
 ValueRange MemoryInterface::addrPorts() {
   if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
     return memOp->addrPorts();
@@ -218,6 +241,13 @@ bool MemoryInterface::sequentialReads() {
     return false;
   }
   return std::get<MemoryPortsImpl>(impl).seqReads;
+}
+
+bool MemoryInterface::hasAccessSize() {
+  if (std::holds_alternative<calyx::MemoryOp>(impl)) {
+    return false;
+  }
+  return std::get<MemoryPortsImpl>(impl).hasAccessSize;
 }
 
 //===----------------------------------------------------------------------===//
@@ -575,9 +605,9 @@ void InlineCombGroups::recurseInlineCombGroups(
     //   LateSSAReplacement)
     if (src.isa<BlockArgument>() ||
         isa<calyx::RegisterOp, calyx::MemoryOp, hw::ConstantOp,
-            mlir::arith::ConstantOp, calyx::MultPipeLibOp, calyx::DivUPipeLibOp,
-            calyx::DivSPipeLibOp, calyx::RemSPipeLibOp, calyx::RemUPipeLibOp,
-            mlir::scf::WhileOp>(src.getDefiningOp()))
+            hw::ArrayCreateOp, mlir::arith::ConstantOp, calyx::MultPipeLibOp,
+            calyx::DivUPipeLibOp, calyx::DivSPipeLibOp, calyx::RemSPipeLibOp,
+            calyx::RemUPipeLibOp, mlir::scf::WhileOp>(src.getDefiningOp()))
       continue;
 
     auto srcCombGroup = dyn_cast<calyx::CombGroupOp>(
@@ -606,8 +636,8 @@ RewriteMemoryAccesses::partiallyLower(calyx::AssignOp assignOp,
     return success();
 
   Value src = assignOp.getSrc();
-  unsigned srcBits = src.getType().getIntOrFloatBitWidth();
-  unsigned dstBits = dest.getType().getIntOrFloatBitWidth();
+  unsigned srcBits = getTypeSize(src.getType());
+  unsigned dstBits = getTypeSize(dest.getType());
   if (srcBits == dstBits)
     return success();
 
@@ -647,12 +677,10 @@ BuildBasicBlockRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
     for (auto arg : enumerate(block->getArguments())) {
       Type argType = arg.value().getType();
-      assert(argType.isa<IntegerType>() && "unsupported block argument type");
-      unsigned width = argType.getIntOrFloatBitWidth();
       std::string index = std::to_string(arg.index());
       std::string name = loweringState().blockName(block) + "_arg" + index;
       auto reg = createRegister(arg.value().getLoc(), rewriter, getComponent(),
-                                width, name);
+                                argType, name);
       getState().addBlockArgReg(block, reg, arg.index());
       arg.value().replaceAllUsesWith(reg.getOut());
     }
@@ -670,11 +698,9 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
   for (auto argType : enumerate(funcOp.getResultTypes())) {
     auto convArgType = calyx::convIndexType(rewriter, argType.value());
-    assert(convArgType.isa<IntegerType>() && "unsupported return type");
-    unsigned width = convArgType.getIntOrFloatBitWidth();
     std::string name = "ret_arg" + std::to_string(argType.index());
-    auto reg =
-        createRegister(funcOp.getLoc(), rewriter, getComponent(), width, name);
+    auto reg = createRegister(funcOp.getLoc(), rewriter, getComponent(),
+                              convArgType, name);
     getState().addReturnReg(reg, argType.index());
 
     rewriter.setInsertionPointToStart(
