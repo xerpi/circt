@@ -56,7 +56,11 @@ bool matchConstantOp(Operation *op, APInt &value);
 // the memory referenced by loadOp.
 bool singleLoadFromMemory(Value memoryReference);
 
-// Returns true if there are no memref::StoreOp uses with the referenced
+// Returns true if there are no memref/vector::LoadOp uses with the referenced
+// memory.
+bool noLoadsFromMemory(Value memoryReference);
+
+// Returns true if there are no memref/vector::StoreOp uses with the referenced
 // memory.
 bool noStoresToMemory(Value memoryReference);
 
@@ -95,6 +99,7 @@ struct MemoryPortsImpl {
   Value readEn;
   bool hasAccessSize = false;
   Value accessSize;
+  int dataBusWidth;
 };
 
 // Represents the interface of memory in Calyx. The various lowering passes
@@ -118,6 +123,7 @@ struct MemoryInterface {
 
   bool sequentialReads();
   bool hasAccessSize();
+  int getDataBusWidth();
 
 private:
   std::variant<calyx::MemoryOp, MemoryPortsImpl> impl;

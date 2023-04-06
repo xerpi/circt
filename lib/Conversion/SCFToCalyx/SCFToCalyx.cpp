@@ -297,7 +297,70 @@ private:
       rewriter.create<calyx::AssignOp>(loc, addrPorts[address.index()],
                                        address.value());
   }
+
+  Value generateMemReadDataShift(PatternRewriter &rewriter, Value readData,
+                                 calyx::CombGroupOp combGroup,
+                                 calyx::MemoryInterface memoryInterface,
+                                 int accessSizeBits, Location loc,
+                                 Value addrValue) const;
 };
+
+Value BuildOpGroups::generateMemReadDataShift(
+    PatternRewriter &rewriter, Value readData, calyx::CombGroupOp combGroup,
+    calyx::MemoryInterface memoryInterface, int accessSizeBits, Location loc,
+    Value addrValue) const {
+  int addrWidth = addrValue.getType().getIntOrFloatBitWidth();
+  auto addrWidthType = rewriter.getIntegerType(addrWidth);
+  int dataBusWidth = memoryInterface.getDataBusWidth();
+  auto dataBusWidthType = rewriter.getIntegerType(dataBusWidth);
+  auto accessSizeBitsType = rewriter.getIntegerType(accessSizeBits);
+  auto cstBusDataWidthBytesMinus1 = createConstant(
+      loc, rewriter, getComponent(), addrWidth, (dataBusWidth + 7) / 8 - 1);
+
+  llvm::errs() << "LOAD: addrWidth: " << addrWidth
+               << ", accessSizeBits: " << accessSizeBits
+               << ", dataBusWidth: " << dataBusWidth << "\n";
+
+  auto andOp =
+      getState<ComponentLoweringState>()
+          .getNewLibraryOpInstance<calyx::AndLibOp>(
+              rewriter, loc, {addrWidthType, addrWidthType, addrWidthType});
+  auto padOp = getState<ComponentLoweringState>()
+                   .getNewLibraryOpInstance<calyx::PadLibOp>(
+                       rewriter, loc, {addrWidthType, dataBusWidthType});
+  auto rshOp = getState<ComponentLoweringState>()
+                   .getNewLibraryOpInstance<calyx::RshLibOp>(
+                       rewriter, loc,
+                       {dataBusWidthType, dataBusWidthType, dataBusWidthType});
+  auto sliceOp = getState<ComponentLoweringState>()
+                     .getNewLibraryOpInstance<calyx::SliceLibOp>(
+                         rewriter, loc, {dataBusWidthType, accessSizeBitsType});
+
+  {
+    IRRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(combGroup.getBodyBlock());
+    // mask = addr % bus_width
+    rewriter.create<calyx::AssignOp>(loc, andOp.getLeft(), addrValue);
+    rewriter.create<calyx::AssignOp>(loc, andOp.getRight(),
+                                     cstBusDataWidthBytesMinus1);
+    // extend mask
+    rewriter.create<calyx::AssignOp>(loc, padOp.getIn(), andOp.getOut());
+    // data = data >> mask
+    rewriter.create<calyx::AssignOp>(loc, rshOp.getLeft(), readData);
+    rewriter.create<calyx::AssignOp>(loc, rshOp.getRight(), padOp.getOut());
+    // readData = data[0 :+ accessSizeBits]
+    rewriter.create<calyx::AssignOp>(loc, sliceOp.getIn(), rshOp.getOut());
+  }
+  getState<ComponentLoweringState>().registerEvaluatingGroup(andOp.getOut(),
+                                                             combGroup);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(padOp.getOut(),
+                                                             combGroup);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(rshOp.getOut(),
+                                                             combGroup);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(sliceOp.getOut(),
+                                                             combGroup);
+  return sliceOp.getOut();
+}
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::LoadOp loadOp) const {
@@ -312,13 +375,28 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         loadOp.getMemRefType().getElementTypeBitWidth(),
         getState<ComponentLoweringState>().getUniqueName("load_seq"));
 
+    auto notOp = getState<ComponentLoweringState>()
+                     .getNewLibraryOpInstance<calyx::NotLibOp>(
+                         rewriter, loadOp.getLoc(),
+                         {rewriter.getI1Type(), rewriter.getI1Type()});
+
+    auto combGroup = createGroupForOp<calyx::CombGroupOp>(rewriter, loadOp);
+    {
+      IRRewriter::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToEnd(combGroup.getBodyBlock());
+      rewriter.create<calyx::AssignOp>(loadOp.getLoc(), notOp.getIn(),
+                                       reg.getDone());
+    }
+    getState<ComponentLoweringState>().registerEvaluatingGroup(notOp.getOut(),
+                                                               combGroup);
+
     assignAddressPorts(rewriter, loadOp.getLoc(), group, memoryInterface,
                        loadOp.getIndices());
     rewriter.setInsertionPointToEnd(group.getBodyBlock());
-    rewriter.create<calyx::AssignOp>(
-        loadOp.getLoc(), memoryInterface.readEn(),
-        createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1));
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
+                                     notOp.getOut());
 
+    Value readData = memoryInterface.readData();
     if (memoryInterface.hasAccessSize()) {
       int accessSizeBits = calyx::getTypeSize(loadOp.getResult().getType());
       assert(accessSizeBits % 8 == 0);
@@ -327,13 +405,16 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
           loadOp.getLoc(), memoryInterface.accessSize(),
           createConstant(loadOp.getLoc(), rewriter, getComponent(), 3,
                          accessSize));
+
+      readData = generateMemReadDataShift(
+          rewriter, readData, combGroup, memoryInterface, accessSizeBits,
+          loadOp.getLoc(), loadOp.getIndices()[0]);
     }
 
     // Assign the memory read data to the register input, and the memory read
     // done signal to the register "write enable". Group done is driven
     // by the register done signal.
-    calyx::buildAssignmentsForRegisterWrite(rewriter, group, reg,
-                                            memoryInterface.readData(),
+    calyx::buildAssignmentsForRegisterWrite(rewriter, group, reg, readData,
                                             memoryInterface.done());
     loadOp.getResult().replaceAllUsesWith(reg.getOut());
 
@@ -446,13 +527,28 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       loadOp.getLoc(), rewriter, getComponent(), loadOp.getVectorType(),
       getState<ComponentLoweringState>().getUniqueName("load_seq"));
 
+  auto notOp = getState<ComponentLoweringState>()
+                   .getNewLibraryOpInstance<calyx::NotLibOp>(
+                       rewriter, loadOp.getLoc(),
+                       {rewriter.getI1Type(), rewriter.getI1Type()});
+
+  auto combGroup = createGroupForOp<calyx::CombGroupOp>(rewriter, loadOp);
+  {
+    IRRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(combGroup.getBodyBlock());
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), notOp.getIn(),
+                                     reg.getDone());
+  }
+  getState<ComponentLoweringState>().registerEvaluatingGroup(notOp.getOut(),
+                                                             combGroup);
+
   assignAddressPorts(rewriter, loadOp.getLoc(), group, memoryInterface,
                      loadOp.getIndices());
   rewriter.setInsertionPointToEnd(group.getBodyBlock());
-  rewriter.create<calyx::AssignOp>(
-      loadOp.getLoc(), memoryInterface.readEn(),
-      createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1));
+  rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
+                                   notOp.getOut());
 
+  Value readData = memoryInterface.readData();
   if (memoryInterface.hasAccessSize()) {
     int accessSizeBits = calyx::getTypeSize(loadOp.getVectorType());
     assert(accessSizeBits % 8 == 0);
@@ -461,13 +557,17 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         loadOp.getLoc(), memoryInterface.accessSize(),
         createConstant(loadOp.getLoc(), rewriter, getComponent(), 3,
                        accessSize));
+
+    readData = generateMemReadDataShift(
+        rewriter, readData, combGroup, memoryInterface, accessSizeBits,
+        loadOp.getLoc(), loadOp.getIndices()[0]);
   }
 
   // Assign the memory read data to the register input, and the memory read
   // done signal to the register "write enable". Group done is driven
   // by the register done signal.
-  calyx::buildAssignmentsForRegisterWrite(
-      rewriter, group, reg, memoryInterface.readData(), memoryInterface.done());
+  calyx::buildAssignmentsForRegisterWrite(rewriter, group, reg, readData,
+                                          memoryInterface.done());
   loadOp.getResult().replaceAllUsesWith(reg.getOut());
 
   // This is a sequential group, so register it as being scheduleable for the
@@ -962,6 +1062,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       mapping.getFirst().replaceAllUsesWith(
           compOp.getArgument(mapping.getSecond()));
 
+    rewriter.setInsertionPointToStart(compOp.getWiresOp().getBodyBlock());
+
     /// Register external memories
     for (auto extMemPortInfo : extMemoryCompPortInfo) {
       /// Create a mapping for the in- and output ports using the Calyx memory
@@ -991,6 +1093,20 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         extMemPorts.hasAccessSize = true;
         extMemPorts.accessSize = compOp.getArgument(outPortsIt);
       }
+
+      if (seqReads && calyx::noLoadsFromMemory(extMemPortInfo.getFirst())) {
+        rewriter.create<calyx::AssignOp>(
+            funcOp.getLoc(), extMemPorts.readEn,
+            createConstant(funcOp.getLoc(), rewriter, compOp, 1, 0));
+      }
+
+      if (calyx::noStoresToMemory(extMemPortInfo.getFirst())) {
+        rewriter.create<calyx::AssignOp>(
+            funcOp.getLoc(), extMemPorts.writeEn,
+            createConstant(funcOp.getLoc(), rewriter, compOp, 1, 0));
+      }
+
+      extMemPorts.dataBusWidth = extMemPortInfo.getSecond().dataBusWidth;
 
       /// Register the external memory ports as a memory interface within the
       /// component.

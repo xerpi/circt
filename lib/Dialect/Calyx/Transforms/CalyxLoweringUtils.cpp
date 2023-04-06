@@ -17,6 +17,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 
 #include <variant>
@@ -144,13 +145,22 @@ bool matchConstantOp(Operation *op, APInt &value) {
 
 bool singleLoadFromMemory(Value memoryReference) {
   return llvm::count_if(memoryReference.getUses(), [](OpOperand &user) {
-           return isa<mlir::memref::LoadOp>(user.getOwner());
+           return isa<mlir::memref::LoadOp>(user.getOwner()) ||
+                  isa<mlir::vector::LoadOp>(user.getOwner());
          }) <= 1;
+}
+
+bool noLoadsFromMemory(Value memoryReference) {
+  return llvm::none_of(memoryReference.getUses(), [](OpOperand &user) {
+    return isa<mlir::memref::LoadOp>(user.getOwner()) ||
+           isa<mlir::vector::LoadOp>(user.getOwner());
+  });
 }
 
 bool noStoresToMemory(Value memoryReference) {
   return llvm::none_of(memoryReference.getUses(), [](OpOperand &user) {
-    return isa<mlir::memref::StoreOp>(user.getOwner());
+    return isa<mlir::memref::StoreOp>(user.getOwner()) ||
+           isa<mlir::vector::StoreOp>(user.getOwner());
   });
 }
 
@@ -248,6 +258,13 @@ bool MemoryInterface::hasAccessSize() {
     return false;
   }
   return std::get<MemoryPortsImpl>(impl).hasAccessSize;
+}
+
+int MemoryInterface::getDataBusWidth() {
+  if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
+    return memOp->getWidth();
+  }
+  return std::get<MemoryPortsImpl>(impl).dataBusWidth;
 }
 
 //===----------------------------------------------------------------------===//
