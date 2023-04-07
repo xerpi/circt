@@ -476,15 +476,15 @@ private:
 
     Value add;
     if (auto arrayType = dyn_cast<hw::ArrayType>(left.getType())) {
-      SmallVector<Value> values;
+      SmallVector<Value> lanes(arrayType.getSize());
       for (size_t i = 0; i < arrayType.getSize(); i++) {
         auto index = b.create<hw::ConstantOp>(b.getIntegerAttr(
             b.getIntegerType(llvm::Log2_32_Ceil(arrayType.getSize())), i));
         auto l = b.createOrFold<hw::ArrayGetOp>(left, index);
         auto r = b.createOrFold<hw::ArrayGetOp>(right, index);
-        values.push_back(b.create<ResultTy>(l, r, false));
+        lanes[lanes.size() - i - 1] = b.create<ResultTy>(l, r, false);
       }
-      add = b.create<hw::ArrayCreateOp>(values);
+      add = b.create<hw::ArrayCreateOp>(lanes);
     } else {
       add = b.create<ResultTy>(left, right, false);
     }
@@ -530,19 +530,15 @@ private:
     auto clockEn = b.create<AndOp>(go, createOrFoldNot(done, b));
 
     if (auto arrayType = dyn_cast<hw::ArrayType>(left.getType())) {
-      SmallVector<TargetOpTy> lanes;
+      SmallVector<TargetOpTy> lanes(arrayType.getSize());
       for (size_t i = 0; i < arrayType.getSize(); i++) {
         auto index = b.create<hw::ConstantOp>(b.getIntegerAttr(
             b.getIntegerType(llvm::Log2_32_Ceil(arrayType.getSize())), i));
         auto l = b.createOrFold<hw::ArrayGetOp>(left, index);
         auto r = b.createOrFold<hw::ArrayGetOp>(right, index);
         TargetOpTy val = b.create<TargetOpTy>(l, r, false);
-        llvm::outs() << "getResults: " << val->getResults().size() << "\n";
-        lanes.push_back(val);
+        lanes[lanes.size() - i - 1] = val;
       }
-
-      llvm::outs() << "Num ports: " << op.getOutputPorts().size() << "\n";
-
       for (size_t i = 0; i < llvm::range_size(op.getOutputPorts()); i++) {
         SmallVector<Value> resultValues;
         for (auto &lane : lanes) {
