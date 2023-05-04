@@ -623,6 +623,7 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
   // compiler to provide initialized memories.
   memoryOp->setAttr("external",
                     IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
+  // Currently unused
   if (auto vectorType = memtype.getElementType().dyn_cast<VectorType>()) {
     memoryOp->setAttr("calyx.lanes",
                       rewriter.getI32IntegerAttr(vectorType.getNumElements()));
@@ -1064,6 +1065,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
             memref.getElementType().getIntOrFloatBitWidth() / 8);
         auto port = compOp.getArgument(outPortsIt++);
 
+        // For external memories, left-shift to obtain the
+        // address in byte (and not the element index)
         calyx::WireLibOp wire;
         calyx::LshLibOp lsh;
         {

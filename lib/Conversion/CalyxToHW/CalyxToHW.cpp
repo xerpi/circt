@@ -408,39 +408,10 @@ private:
           auto reset =
               wireIn(op.reset(), op.instanceName(), op.portName(op.reset()), b);
 
-          SmallVector<Value> addrPorts /*, addrPortsShifted*/;
-          for (const auto &port : op.addrPorts()) {
-            llvm::errs() << "port: " << port << "\n";
-            auto addr = wireIn(port, op.instanceName(), op.portName(port), b);
-            addrPorts.push_back(addr);
-#if 0
-            // Addrs address individual bytes.
-            int shiftBits = llvm::Log2_32_Ceil(op.getWidth() / 8);
-            llvm::errs() << "op.getWidth() " << op.getWidth() << "\n";
-            llvm::errs() << "shiftBits " << shiftBits << "\n";
-            auto shiftBitsCst = b.create<hw::ConstantOp>(
-                b.getIntegerAttr(port.getType(), shiftBits));
-            auto shifted = b.create<comb::ShrUOp>(addr, shiftBitsCst);
-            addrPortsShifted.push_back(shifted);
-#endif
-#if 0
-            // HACK: Get rid of offset bits
-            // llvm::errs() << "Has attr? " << op->hasAttr("calyx.lanes") <<
-            // "\n";
-            if (op->hasAttr("calyx.lanes")) {
-              int lanes =
-                  op->getAttr("calyx.lanes").cast<IntegerAttr>().getInt();
-              int offsetBits = llvm::Log2_32_Ceil(lanes);
-              llvm::errs() << "calyx.lanes " << lanes << "\n";
-              llvm::errs() << "offsetBits " << offsetBits << "\n";
-              auto offsetBitsCst = b.create<hw::ConstantOp>(
-                  b.getIntegerAttr(port.getType(), offsetBits));
-              auto shifted = b.create<comb::ShrUOp>(addr, offsetBitsCst);
-              addrPortsShifted.push_back(shifted);
-
-            }
-#endif
-          }
+          SmallVector<Value> addrPorts;
+          for (const auto &port : op.addrPorts())
+            addrPorts.push_back(
+                wireIn(port, op.instanceName(), op.portName(port), b));
 
           auto writeData = wireIn(op.writeData(), op.instanceName(),
                                   op.portName(op.writeData()), b);
