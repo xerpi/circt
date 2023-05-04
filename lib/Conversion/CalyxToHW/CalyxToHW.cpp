@@ -292,6 +292,9 @@ struct ConvertCellOp : public OpInterfaceConversionPattern<CellInterface> {
     convertPrimitiveOp(cell, wires, builder);
     if (wires.size() != cell.getPortInfo().size()) {
       auto diag = cell.emitOpError("couldn't convert to core primitive");
+      llvm::errs() << "wires.size(): " << wires.size() << " vs "
+                   << "cell.getPortInfo().size(): " << cell.getPortInfo().size()
+                   << "\n";
       for (Value wire : wires)
         diag.attachNote() << "with wire: " << wire;
       return diag;
@@ -399,6 +402,82 @@ private:
           wires.append({in.getInput(), writeEn.getInput(), clk.getInput(),
                         reset.getInput(), out, done});
         })
+        .Case([&](MemoryOp op) {
+          auto clk =
+              wireIn(op.clk(), op.instanceName(), op.portName(op.clk()), b);
+          auto reset =
+              wireIn(op.reset(), op.instanceName(), op.portName(op.reset()), b);
+
+          SmallVector<Value> addrPorts /*, addrPortsShifted*/;
+          for (const auto &port : op.addrPorts()) {
+            llvm::errs() << "port: " << port << "\n";
+            auto addr = wireIn(port, op.instanceName(), op.portName(port), b);
+            addrPorts.push_back(addr);
+#if 0
+            // Addrs address individual bytes.
+            int shiftBits = llvm::Log2_32_Ceil(op.getWidth() / 8);
+            llvm::errs() << "op.getWidth() " << op.getWidth() << "\n";
+            llvm::errs() << "shiftBits " << shiftBits << "\n";
+            auto shiftBitsCst = b.create<hw::ConstantOp>(
+                b.getIntegerAttr(port.getType(), shiftBits));
+            auto shifted = b.create<comb::ShrUOp>(addr, shiftBitsCst);
+            addrPortsShifted.push_back(shifted);
+#endif
+#if 0
+            // HACK: Get rid of offset bits
+            // llvm::errs() << "Has attr? " << op->hasAttr("calyx.lanes") <<
+            // "\n";
+            if (op->hasAttr("calyx.lanes")) {
+              int lanes =
+                  op->getAttr("calyx.lanes").cast<IntegerAttr>().getInt();
+              int offsetBits = llvm::Log2_32_Ceil(lanes);
+              llvm::errs() << "calyx.lanes " << lanes << "\n";
+              llvm::errs() << "offsetBits " << offsetBits << "\n";
+              auto offsetBitsCst = b.create<hw::ConstantOp>(
+                  b.getIntegerAttr(port.getType(), offsetBits));
+              auto shifted = b.create<comb::ShrUOp>(addr, offsetBitsCst);
+              addrPortsShifted.push_back(shifted);
+
+            }
+#endif
+          }
+
+          auto writeData = wireIn(op.writeData(), op.instanceName(),
+                                  op.portName(op.writeData()), b);
+          auto writeEn = wireIn(op.writeEn(), op.instanceName(),
+                                op.portName(op.writeEn()), b);
+          auto readEn = wireIn(op.readEn(), op.instanceName(),
+                               op.portName(op.readEn()), b);
+
+          auto en = b.create<OrOp>(writeEn, readEn);
+
+          auto doneReg =
+              reg(en, clk, reset, op.instanceName() + "_done_reg", b);
+          auto done = wireOut(doneReg, op.instanceName(), "", b);
+
+          auto writeEnMsk = b.create<AndOp>(writeEn, createOrFoldNot(done, b));
+
+          SmallVector<int64_t> shape;
+          for (auto size : op.getSizes())
+            shape.push_back(size.dyn_cast<IntegerAttr>().getInt());
+
+          seq::HLMemOp hlMem = b.create<seq::HLMemOp>(
+              clk, reset, b.getStringAttr(op.instanceName() + "_mem"), shape,
+              b.getIntegerType(op.getWidth()));
+
+          seq::WritePortOp writePort = b.create<seq::WritePortOp>(
+              hlMem, addrPorts, writeData, writeEnMsk,
+              /*latency=*/1);
+          seq::ReadPortOp readPort = b.create<seq::ReadPortOp>(
+              hlMem, addrPorts, readEn, /*latency=*/0);
+
+          auto readData = wireOut(readPort, op.instanceName(), "", b);
+
+          wires.append(addrPorts);
+          wires.append({writeData.getInput(), writeEn.getInput(),
+                        clk.getInput(), reset.getInput(), readData,
+                        readEn.getInput(), done});
+        })
         // Unary operqations.
         .Case([&](SliceLibOp op) {
           auto in =
@@ -447,9 +526,6 @@ private:
         .Case([&](SplatLibOp op) {
           auto in =
               wireIn(op.getIn(), op.instanceName(), op.portName(op.getIn()), b);
-
-          llvm::errs() << "SplatLibOp\n";
-          op.dump();
 
           VectorType outType = op.getOut().getType().dyn_cast<VectorType>();
           assert(outType);

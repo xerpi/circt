@@ -122,9 +122,9 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              memref::StoreOp,
                              /// standard arithmetic
                              AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
-                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
-                             MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                             IndexCastOp,
+                             AndIOp, XOrIOp, OrIOp, MinSIOp, ExtUIOp, ExtSIOp,
+                             TruncIOp, MulIOp, DivUIOp, DivSIOp, RemUIOp,
+                             RemSIOp, IndexCastOp,
                              /// Vector
                              vector::SplatOp, vector::LoadOp, vector::StoreOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
@@ -165,6 +165,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, OrIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, XOrIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, CmpIOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, MinSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, TruncIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ExtUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ExtSIOp op) const;
@@ -617,11 +618,18 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
   }
   auto memoryOp = rewriter.create<calyx::MemoryOp>(
       allocOp.getLoc(), componentState.getUniqueName("mem"),
-      memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
+      calyx::getTypeSize(memtype.getElementType()), sizes, addrSizes);
   // Externalize memories by default. This makes it easier for the native
   // compiler to provide initialized memories.
   memoryOp->setAttr("external",
                     IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
+  if (auto vectorType = memtype.getElementType().dyn_cast<VectorType>()) {
+    memoryOp->setAttr("calyx.lanes",
+                      rewriter.getI32IntegerAttr(vectorType.getNumElements()));
+  }
+  if (allocOp->hasAttr(circt::scfToCalyx::sSequentialReads))
+    memoryOp->setAttr(circt::scfToCalyx::sSequentialReads,
+                      allocOp->getAttr(circt::scfToCalyx::sSequentialReads));
   componentState.registerMemoryInterface(allocOp.getResult(),
                                          calyx::MemoryInterface(memoryOp));
   return success();
@@ -790,6 +798,49 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
   llvm_unreachable("unsupported comparison predicate");
 }
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     MinSIOp op) const {
+
+  SmallVector<Type> types;
+  llvm::append_range(types, op.getOperandTypes());
+  types.push_back(rewriter.getI1Type());
+
+  auto guardLe = getState<ComponentLoweringState>()
+                     .getNewLibraryOpInstance<calyx::SleLibOp>(
+                         rewriter, op.getLoc(), types);
+
+  auto guardGt = getState<ComponentLoweringState>()
+                     .getNewLibraryOpInstance<calyx::SgtLibOp>(
+                         rewriter, op.getLoc(), types);
+
+  auto wire = getState<ComponentLoweringState>()
+                  .getNewLibraryOpInstance<calyx::WireLibOp>(
+                      rewriter, op.getLoc(), op.getResult().getType());
+
+  auto combGroup = createGroupForOp<calyx::CombGroupOp>(rewriter, op);
+  rewriter.setInsertionPointToEnd(combGroup.getBodyBlock());
+
+  rewriter.create<calyx::AssignOp>(op.getLoc(), guardLe.getLeft(), op.getLhs());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), guardLe.getRight(),
+                                   op.getRhs());
+
+  rewriter.create<calyx::AssignOp>(op.getLoc(), guardGt.getLeft(), op.getLhs());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), guardGt.getRight(),
+                                   op.getRhs());
+
+  rewriter.create<calyx::AssignOp>(op.getLoc(), wire.getIn(), op.getLhs(),
+                                   guardLe.getOut());
+  rewriter.create<calyx::AssignOp>(op.getLoc(), wire.getIn(), op.getRhs(),
+                                   guardGt.getOut());
+
+  op.getResult().replaceAllUsesWith(wire.getOut());
+
+  getState<ComponentLoweringState>().registerEvaluatingGroup(wire.getOut(),
+                                                             combGroup);
+  return success();
+}
+
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      TruncIOp op) const {
   return buildLibraryOp<calyx::CombGroupOp, calyx::SliceLibOp>(
@@ -993,10 +1044,13 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     rewriter.setInsertionPointToStart(compOp.getWiresOp().getBodyBlock());
 
     /// Register external memories
+    int idx = 0;
     for (auto extMemPortInfo : extMemoryCompPortInfo) {
       /// Create a mapping for the in- and output ports using the Calyx memory
       /// port structure.
       calyx::MemoryPortsImpl extMemPorts;
+      MemRefType memref =
+          extMemPortInfo.getFirst().getType().cast<MemRefType>();
       unsigned inPortsIt = extMemPortInfo.getSecond().inPortsIndex;
       unsigned outPortsIt = extMemPortInfo.getSecond().outPortsIndex +
                             compOp.getInputPortInfo().size();
@@ -1004,13 +1058,41 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       extMemPorts.readData = compOp.getArgument(inPortsIt++);
       extMemPorts.done = compOp.getArgument(inPortsIt);
       extMemPorts.writeData = compOp.getArgument(outPortsIt++);
-      unsigned nAddresses = extMemPortInfo.getFirst()
-                                .getType()
-                                .cast<MemRefType>()
-                                .getShape()
-                                .size();
-      for (unsigned j = 0; j < nAddresses; ++j)
-        extMemPorts.addrPorts.push_back(compOp.getArgument(outPortsIt++));
+      unsigned nAddresses = memref.getShape().size();
+      for (unsigned j = 0; j < nAddresses; ++j) {
+        int bits = llvm::Log2_32_Ceil(
+            memref.getElementType().getIntOrFloatBitWidth() / 8);
+        auto port = compOp.getArgument(outPortsIt++);
+
+        calyx::WireLibOp wire;
+        calyx::LshLibOp lsh;
+        {
+          IRRewriter::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(compOp.getBodyBlock());
+          wire = rewriter.create<calyx::WireLibOp>(
+              funcOp.getLoc(),
+              "ext_mem_" + std::to_string(idx) + "_addr_" + std::to_string(j) +
+                  "_wire",
+              rewriter.getI64Type());
+
+          lsh = rewriter.create<calyx::LshLibOp>(
+              funcOp.getLoc(),
+              "ext_mem_" + std::to_string(idx) + "_addr_" + std::to_string(j) +
+                  "_lsh",
+              TypeRange{rewriter.getI64Type(), rewriter.getI64Type(),
+                        rewriter.getI64Type()});
+        }
+
+        rewriter.create<calyx::AssignOp>(funcOp.getLoc(), lsh.getLeft(),
+                                         wire.getOut());
+        rewriter.create<calyx::AssignOp>(
+            funcOp.getLoc(), lsh.getRight(),
+            createConstant(funcOp.getLoc(), rewriter, compOp, 64, bits));
+        rewriter.create<calyx::AssignOp>(funcOp.getLoc(), port, lsh.getOut());
+
+        extMemPorts.addrPorts.push_back(wire.getIn());
+      }
+      idx++;
       extMemPorts.writeEn = compOp.getArgument(outPortsIt++);
 
       extMemPorts.seqReads = seqReads;
@@ -1446,9 +1528,9 @@ public:
     target.addIllegalDialect<ArithDialect>();
     target.addIllegalDialect<VectorDialect>();
     target.addLegalOp<AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
-                      XOrIOp, OrIOp, ExtUIOp, TruncIOp, CondBranchOp, BranchOp,
-                      MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp, ReturnOp,
-                      arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
+                      XOrIOp, OrIOp, MinSIOp, ExtUIOp, TruncIOp, CondBranchOp,
+                      BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
+                      ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp,
                       vector::SplatOp, vector::LoadOp, vector::StoreOp>();
 
     RewritePatternSet legalizePatterns(&getContext());

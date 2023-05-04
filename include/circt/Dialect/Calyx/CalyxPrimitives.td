@@ -111,8 +111,10 @@ def MemoryOp : CalyxPrimitive<"memory", []> {
     Value writeData() { return getResult(getNumDimensions()); }
     Value writeEn()   { return getResult(getNumDimensions() + 1); }
     Value clk()       { return getResult(getNumDimensions() + 2); }
-    Value readData()  { return getResult(getNumDimensions() + 3); }
-    Value done()      { return getResult(getNumDimensions() + 4); }
+    Value reset()     { return getResult(getNumDimensions() + 3); }
+    Value readData()  { return getResult(getNumDimensions() + 4); }
+    Value readEn()    { return getResult(getNumDimensions() + 5); }
+    Value done()      { return getResult(getNumDimensions() + 6); }
   }];
 }
 

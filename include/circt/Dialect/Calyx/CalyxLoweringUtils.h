@@ -383,6 +383,16 @@ public:
     return builder.create<TLibraryOp>(loc, getUniqueName(name), resTypes);
   }
 
+  template <typename TLibraryOp>
+  TLibraryOp getNewLibraryOpInstance(OpBuilder &builder, Location loc,
+                                     Type resType) {
+    mlir::IRRewriter::InsertionGuard guard(builder);
+    Block *body = component.getBodyBlock();
+    builder.setInsertionPoint(body, body->begin());
+    auto name = TLibraryOp::getOperationName().split(".").second;
+    return builder.create<TLibraryOp>(loc, getUniqueName(name), resType);
+  }
+
 private:
   /// The component which this lowering state is associated to.
   calyx::ComponentOp component;

@@ -945,7 +945,8 @@ static LogicalResult isCombinational(Value value, GroupInterface group) {
   if (isa<comb::CombDialect, hw::HWDialect>(definingOp->getDialect()))
     return success();
 
-  // Reads to MemoryOp and RegisterOp are combinational. Writes are not.
+  // Reads and RegisterOp are combinational. Writes or reads to MemoryOp are
+  // not.
   if (auto r = dyn_cast<RegisterOp>(definingOp)) {
     return value == r.getOut()
                ? success()
@@ -954,12 +955,12 @@ static LogicalResult isCombinational(Value value, GroupInterface group) {
                      << "\" is conducting a memory store. This is not "
                         "combinational.";
   } else if (auto m = dyn_cast<MemoryOp>(definingOp)) {
-    auto writePorts = {m.writeData(), m.writeEn()};
+    auto writePorts = {m.writeData(), m.writeEn(), m.readEn()};
     return (llvm::none_of(writePorts, [&](Value p) { return p == value; }))
                ? success()
                : group->emitOpError()
                      << "with memory: \"" << m.instanceName()
-                     << "\" is conducting a memory store. This "
+                     << "\" is conducting a memory load/store. This "
                         "is not combinational.";
   }
 
@@ -1789,7 +1790,8 @@ SmallVector<StringRef> MemoryOp::portNames() {
         StringAttr::get(this->getContext(), "addr" + std::to_string(i));
     portNames.push_back(nameAttr.getValue());
   }
-  portNames.append({"write_data", "write_en", "clk", "read_data", "done"});
+  portNames.append({"write_data", "write_en", "clk", "reset", "read_data",
+                    "read_en", "done"});
   return portNames;
 }
 
@@ -1797,7 +1799,7 @@ SmallVector<Direction> MemoryOp::portDirections() {
   SmallVector<Direction> portDirections;
   for (size_t i = 0, e = getAddrSizes().size(); i != e; ++i)
     portDirections.push_back(Input);
-  portDirections.append({Input, Input, Input, Output, Output});
+  portDirections.append({Input, Input, Input, Input, Output, Input, Output});
   return portDirections;
 }
 
@@ -1809,14 +1811,18 @@ SmallVector<DictionaryAttr> MemoryOp::portAttributes() {
 
   // Use a boolean to indicate this attribute is used.
   IntegerAttr isSet = IntegerAttr::get(IntegerType::get(context, 1), 1);
-  NamedAttrList writeEn, clk, reset, done;
-  writeEn.append("go", isSet);
+  NamedAttrList writeEn, readEn, clk, reset, done;
+  writeEn.append("write_en", isSet);
+  readEn.append("read_en", isSet);
   clk.append("clk", isSet);
+  reset.append("reset", isSet);
   done.append("done", isSet);
   portAttributes.append({DictionaryAttr::get(context),   // In
                          writeEn.getDictionary(context), // Write enable
                          clk.getDictionary(context),     // Clk
+                         reset.getDictionary(context),   // Reset
                          DictionaryAttr::get(context),   // Out
+                         readEn.getDictionary(context),  // Read enable
                          done.getDictionary(context)}    // Done
   );
   return portAttributes;
@@ -1838,7 +1844,9 @@ void MemoryOp::build(OpBuilder &builder, OperationState &state,
   types.push_back(builder.getIntegerType(width));  // Write data
   types.push_back(builder.getI1Type());            // Write enable
   types.push_back(builder.getI1Type());            // Clk
+  types.push_back(builder.getI1Type());            // Reset
   types.push_back(builder.getIntegerType(width));  // Read data
+  types.push_back(builder.getI1Type());            // Read enable
   types.push_back(builder.getI1Type());            // Done
   state.addTypes(types);
 }
@@ -1852,7 +1860,8 @@ LogicalResult MemoryOp::verify() {
     return emitOpError("mismatched number of dimensions (")
            << numDims << ") and address sizes (" << numAddrs << ")";
 
-  size_t numExtraPorts = 5; // write data/enable, clk, and read data/done.
+  size_t numExtraPorts =
+      7; // write data/enable, clk, reset, read data/enable and done.
   if (getNumResults() != numAddrs + numExtraPorts)
     return emitOpError("incorrect number of address ports, expected ")
            << numAddrs;

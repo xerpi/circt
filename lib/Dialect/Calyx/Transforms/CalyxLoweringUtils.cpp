@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
+#include "circt/Conversion/SCFToCalyx.h"
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Support/LLVM.h"
@@ -19,7 +20,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
-
 #include <variant>
 
 using namespace llvm;
@@ -226,8 +226,8 @@ Value MemoryInterface::writeEn() {
 }
 
 Value MemoryInterface::readEn() {
-  if (std::holds_alternative<calyx::MemoryOp>(impl)) {
-    return Value();
+  if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
+    return memOp->readEn();
   }
   return std::get<MemoryPortsImpl>(impl).readEn;
 }
@@ -247,8 +247,11 @@ ValueRange MemoryInterface::addrPorts() {
 }
 
 bool MemoryInterface::sequentialReads() {
-  if (std::holds_alternative<calyx::MemoryOp>(impl)) {
-    return false;
+  if (auto *memOp = std::get_if<calyx::MemoryOp>(&impl); memOp) {
+    return (*memOp)
+        ->getAttr(scfToCalyx::sSequentialReads)
+        .cast<BoolAttr>()
+        .getValue();
   }
   return std::get<MemoryPortsImpl>(impl).seqReads;
 }
